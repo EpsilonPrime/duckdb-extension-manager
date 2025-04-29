@@ -1,0 +1,337 @@
+- name: Install Build Dependencies
+        if: steps.cache-extensions.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          # Install common build dependencies for DuckDB extensions
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake pkg-config git
+          
+          # Check if we need more specific dependencies based on the extensions
+          if grep -q "spatial" extensions.json; then
+            echo "Installing GDAL dependencies for spatial extension..."
+            sudo apt-get install -y libgdal-dev
+          fi
+          
+          # If we're building extensions from GitHub repos, we might need more dependencies
+          if grep -q "https://github.com" extensions.json; then
+            echo "Installing additional dependencies for GitHub repo builds..."
+            sudo apt-get install -y libssl-dev libcurl4-openssl-dev zlib1g-dev
+          finame: 'DuckDB Extension Manager'
+description: 'Downloads and caches DuckDB extensions from different sources'
+branding:
+  icon: 'database'
+  color: 'yellow'
+
+inputs:
+  extensions:
+    description: 'JSON list of extensions to download in the format [{"name": "extension_name", "source": "core|core_nightly|url|direct_url", "version": "tag_or_hash", "url": "complete_extension_url"}]'
+    required: true
+  duckdb-version:
+    description: 'DuckDB version to use'
+    required: false
+    default: 'latest'
+  cache-key:
+    description: 'Custom cache key suffix'
+    required: false
+    default: ''
+  cache-path:
+    description: 'Path to store extensions'
+    required: false
+    default: '.duckdb/extensions'
+
+outputs:
+  cache-hit:
+    description: 'Boolean indicating if a cache hit occurred'
+    value: ${{ steps.cache-extensions.outputs.cache-hit }}
+  extensions-path:
+    description: 'Path where extensions are stored'
+    value: ${{ inputs.cache-path }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Parse Extensions Input
+      id: parse-extensions
+      shell: bash
+      run: |
+        echo "Parsing extensions input..."
+        echo '${{ inputs.extensions }}' > extensions.json
+        cat extensions.json
+    
+    - name: Install Build Dependencies
+      if: steps.cache-extensions.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        # Install common build dependencies for DuckDB extensions
+        sudo apt-get update
+        sudo apt-get install -y build-essential cmake pkg-config git
+        
+        # Check if we need more specific dependencies based on the extensions
+        if grep -q "spatial" extensions.json; then
+          echo "Installing GDAL dependencies for spatial extension..."
+          sudo apt-get install -y libgdal-dev
+        fi
+        
+        # If we're building extensions from GitHub repos, we might need more dependencies
+        if grep -q "https://github.com" extensions.json; then
+          echo "Installing additional dependencies for GitHub repo builds..."
+          sudo apt-get install -y libssl-dev libcurl4-openssl-dev zlib1g-dev
+        fi
+        
+    - name: Set up cache key
+      id: cache-key
+      shell: bash
+      run: |
+        # Generate a deterministic hash based on the extensions input
+        EXTENSIONS_HASH=$(echo '${{ inputs.extensions }}' | sha256sum | cut -d ' ' -f 1)
+        echo "Extensions hash: $EXTENSIONS_HASH"
+        
+        # Include DuckDB version in the cache key
+        CACHE_KEY="duckdb-extensions-${{ inputs.duckdb-version }}-$EXTENSIONS_HASH"
+        
+        # Add custom cache key suffix if provided
+        if [ -n "${{ inputs.cache-key }}" ]; then
+          CACHE_KEY="${CACHE_KEY}-${{ inputs.cache-key }}"
+        fi
+        
+        echo "cache-key=${CACHE_KEY}" >> $GITHUB_OUTPUT
+        echo "Using cache key: ${CACHE_KEY}"
+
+    - name: Cache DuckDB Extensions
+      id: cache-extensions
+      uses: actions/cache@v3
+      with:
+        path: ${{ inputs.cache-path }}
+        key: ${{ steps.cache-key.outputs.cache-key }}
+        
+    - name: Create extensions directory
+      if: steps.cache-extensions.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        mkdir -p ${{ inputs.cache-path }}
+        
+    - name: Download Extensions
+      if: steps.cache-extensions.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        # Function to download core extensions
+        download_core_extension() {
+          local name=$1
+          local is_nightly=$2
+          local version=$3
+          local output_dir=$4
+          
+          # Base URL for extensions
+          local base_url="https://extensions.duckdb.org"
+          
+          if [ "$is_nightly" = "true" ]; then
+            base_url="${base_url}/nightly"
+          fi
+          
+          # If version is specified and not latest, use it
+          local ver_part=""
+          if [ -n "$version" ] && [ "$version" != "latest" ]; then
+            ver_part="/${version}"
+          fi
+          
+          local ext_url="${base_url}/${name}${ver_part}/extension.zip"
+          echo "Downloading core extension from: ${ext_url}"
+          
+          # Create directory for this extension
+          mkdir -p "${output_dir}/${name}"
+          
+          # Download the extension
+          curl -L "${ext_url}" -o "${output_dir}/${name}/extension.zip"
+          
+          # Unzip the extension
+          unzip -o "${output_dir}/${name}/extension.zip" -d "${output_dir}/${name}/"
+          
+          # Remove the zip file
+          rm "${output_dir}/${name}/extension.zip"
+          
+          echo "Downloaded and extracted ${name} extension"
+        }
+        
+        # Function to download extension from GitHub repo
+        download_github_extension() {
+          local repo=$1
+          local ref=$2
+          local name=$3
+          local output_dir=$4
+          
+          # Extract owner and repo name from the URL
+          local repo_path=$(echo "$repo" | sed -E 's|https://github.com/||' | sed -E 's|\.git$||')
+          
+          # Create directory for this extension
+          mkdir -p "${output_dir}/${name}"
+          local work_dir="${output_dir}/${name}/source"
+          
+          echo "Cloning repository ${repo} with ref ${ref}"
+          # First try to clone with the specific reference
+          if git clone --depth 1 --branch "${ref}" "https://github.com/${repo_path}.git" "${work_dir}" 2>/dev/null; then
+            echo "Successfully cloned branch/tag: ${ref}"
+          else
+            echo "Branch/tag not found, trying as commit..."
+            # If that fails, clone the default branch and checkout the specific commit
+            git clone --depth 1 "https://github.com/${repo_path}.git" "${work_dir}" || { echo "Failed to clone repository"; exit 1; }
+            
+            cd "${work_dir}"
+            # Fetch the specific commit if needed
+            git fetch --depth 1 origin "${ref}" || { echo "Fetching ref ${ref} failed"; }
+            git checkout "${ref}" || { echo "Failed to checkout ${ref}"; exit 1; }
+          fi
+          
+          # Now we're in the repo directory
+          cd "${work_dir}"
+          echo "Current directory: $(pwd)"
+          
+          # Check for common build scenarios and handle them
+          
+          # Scenario 1: CMake build system
+          if [ -f "CMakeLists.txt" ]; then
+            echo "Building extension using CMake..."
+            mkdir -p build && cd build
+            
+            # Install build dependencies
+            if [ -f "../scripts/install_dependencies.sh" ]; then
+              echo "Installing dependencies..."
+              bash ../scripts/install_dependencies.sh
+            fi
+            
+            cmake ..
+            make -j$(nproc)
+            
+            # Try to locate the extension files
+            # Typically they are in build/extension or similar directories
+            if [ -d "extension" ]; then
+              cp -r extension/* "${output_dir}/${name}/"
+            else
+              # Copy all .duckdb_extension files
+              find . -name "*.duckdb_extension" -exec cp {} "${output_dir}/${name}/" \;
+              # Copy all shared libraries
+              find . -name "*.so" -exec cp {} "${output_dir}/${name}/" \;
+              find . -name "*.dll" -exec cp {} "${output_dir}/${name}/" \;
+              find . -name "*.dylib" -exec cp {} "${output_dir}/${name}/" \;
+            fi
+            
+            cd "${work_dir}" # Go back to source root
+          fi
+          
+          # Scenario 2: Shell script build
+          if [ -f "build.sh" ]; then
+            echo "Building extension using build.sh"
+            chmod +x build.sh
+            ./build.sh
+            
+            # Try to find the build output
+            if [ -d "build" ] && [ -d "build/extension" ]; then
+              cp -r build/extension/* "${output_dir}/${name}/"
+            fi
+          fi
+          
+          # Scenario 3: Makefile
+          if [ -f "Makefile" ] && [ ! -f "CMakeLists.txt" ]; then
+            echo "Building extension using Makefile"
+            make
+            
+            # Try to find build outputs
+            find . -name "*.duckdb_extension" -exec cp {} "${output_dir}/${name}/" \;
+            find . -name "*.so" -exec cp {} "${output_dir}/${name}/" \;
+            find . -name "*.dll" -exec cp {} "${output_dir}/${name}/" \;
+            find . -name "*.dylib" -exec cp {} "${output_dir}/${name}/" \;
+          fi
+          
+          # If extension files were properly built and copied, there should be extension files in the output directory
+          extension_files=$(find "${output_dir}/${name}" -maxdepth 1 -type f | wc -l)
+          if [ "$extension_files" -lt 1 ]; then
+            echo "WARNING: No extension files found after build. Trying to copy from source directory..."
+            # Fall back to copying any extension files from source
+            find "${work_dir}" -name "*.duckdb_extension" -exec cp {} "${output_dir}/${name}/" \;
+            find "${work_dir}" -name "*.so" -exec cp {} "${output_dir}/${name}/" \;
+            find "${work_dir}" -name "*.dll" -exec cp {} "${output_dir}/${name}/" \;
+            find "${work_dir}" -name "*.dylib" -exec cp {} "${output_dir}/${name}/" \;
+          fi
+          
+          # Check if we have any extension files now
+          extension_files=$(find "${output_dir}/${name}" -maxdepth 1 -type f | wc -l)
+          if [ "$extension_files" -lt 1 ]; then
+            echo "WARNING: Could not find any extension files after building from GitHub repo."
+            echo "Make sure the repository contains a valid DuckDB extension with proper build instructions."
+          else
+            echo "Found $(find "${output_dir}/${name}" -type f | wc -l) files for extension ${name}"
+            find "${output_dir}/${name}" -type f -name "*.so" -o -name "*.dll" -o -name "*.dylib" -o -name "*.duckdb_extension"
+          fi
+          
+          echo "Downloaded and prepared ${name} extension from GitHub"
+        }
+        
+        # Function to download extension from direct URL
+        download_direct_url_extension() {
+          local url=$1
+          local name=$2
+          local output_dir=$3
+          
+          # Create directory for this extension
+          mkdir -p "${output_dir}/${name}"
+          
+          echo "Downloading extension from direct URL: ${url}"
+          
+          # Download the extension
+          if [[ "$url" == *.zip ]]; then
+            # Download and extract zip file
+            curl -L "${url}" -o "${output_dir}/${name}/extension.zip"
+            unzip -o "${output_dir}/${name}/extension.zip" -d "${output_dir}/${name}/"
+            rm "${output_dir}/${name}/extension.zip"
+          else
+            # If not a zip, download directly to the extension directory
+            curl -L "${url}" -o "${output_dir}/${name}/$(basename ${url})"
+          fi
+          
+          echo "Downloaded ${name} extension from URL"
+        }
+
+        # Process each extension
+        jq -c '.[]' extensions.json | while read -r ext; do
+          name=$(echo "$ext" | jq -r '.name')
+          source=$(echo "$ext" | jq -r '.source')
+          version=$(echo "$ext" | jq -r '.version // "latest"')
+          direct_url=$(echo "$ext" | jq -r '.url // ""')
+          
+          echo "Processing extension: $name from $source (version: $version)"
+          
+          # If direct URL is provided, use it regardless of source
+          if [ -n "$direct_url" ] && [ "$direct_url" != "null" ]; then
+            echo "Using direct URL: $direct_url"
+            download_direct_url_extension "$direct_url" "$name" "${{ inputs.cache-path }}"
+            continue
+          fi
+          
+          case "$source" in
+            "core")
+              download_core_extension "$name" "false" "$version" "${{ inputs.cache-path }}"
+              ;;
+            "core_nightly")
+              download_core_extension "$name" "true" "$version" "${{ inputs.cache-path }}"
+              ;;
+            "direct_url")
+              # This is for backward compatibility if someone specifies source as direct_url instead of using the url field
+              if [ -n "$version" ] && [ "$version" != "latest" ]; then
+                download_direct_url_extension "$version" "$name" "${{ inputs.cache-path }}"
+              else
+                echo "Error: When using 'direct_url' source, you must specify a URL in the version field"
+                exit 1
+              fi
+              ;;
+            *)
+              # Assume it's a GitHub repository URL
+              download_github_extension "$source" "$version" "$name" "${{ inputs.cache-path }}"
+              ;;
+          esac
+        done
+        
+    - name: List Downloaded Extensions
+      shell: bash
+      run: |
+        echo "DuckDB extensions downloaded to ${{ inputs.cache-path }}:"
+        ls -la ${{ inputs.cache-path }}
+        find ${{ inputs.cache-path }} -type f | sort
