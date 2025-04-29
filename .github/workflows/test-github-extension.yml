@@ -1,0 +1,39 @@
+name: Test GitHub Repository Extension
+
+on:
+  workflow_dispatch:  # Manual triggering for testing
+
+jobs:
+  test-github-extension:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      # Test with a real GitHub extension repository
+      - name: Test DuckDB Extension Manager - GitHub Repo
+        id: test-github
+        uses: ./
+        with:
+          extensions: |
+            [
+              # Using the official spatial extension repository as an example
+              {"name": "spatial", "source": "https://github.com/duckdb/duckdb_spatial.git", "version": "main"}
+            ]
+          cache-path: '.duckdb/github-extensions'
+      
+      # Verify the build results
+      - name: Verify GitHub extension build
+        run: |
+          echo "Extensions path: ${{ steps.test-github.outputs.extensions-path }}"
+          
+          echo "Extension files:"
+          find ${{ steps.test-github.outputs.extensions-path }} -type f
+          
+          # Check if we have loadable extension files
+          if find ${{ steps.test-github.outputs.extensions-path }} -name "*.duckdb_extension" -o -name "*.so" -o -name "*.dll" -o -name "*.dylib" | grep -q .; then
+            echo "✅ Successfully built extension from GitHub repository"
+          else
+            echo "❌ Failed to build extension from GitHub repository"
+            exit 1
+          fi

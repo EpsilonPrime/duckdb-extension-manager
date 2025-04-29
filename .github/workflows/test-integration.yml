@@ -1,0 +1,77 @@
+name: Test Integration with DuckDB
+
+on:
+  workflow_dispatch:  # Manual triggering for testing
+
+jobs:
+  test-with-duckdb:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      # Setup DuckDB extensions
+      - name: Setup DuckDB Extensions
+        id: extensions
+        uses: ./
+        with:
+          extensions: |
+            [
+              {"name": "json", "source": "core"},
+              {"name": "httpfs", "source": "core"},
+              {"name": "parquet", "source": "core"}
+            ]
+      
+      # Install DuckDB
+      - name: Install DuckDB
+        run: |
+          pip install duckdb
+      
+      # Create a test script using the extensions
+      - name: Create test script
+        run: |
+          echo '
+          import duckdb
+          import os
+          import sys
+          
+          # Connect to DuckDB
+          con = duckdb.connect(":memory:")
+          
+          # Configure extension directory
+          ext_dir = os.environ["EXTENSION_PATH"]
+          print(f"Using extension directory: {ext_dir}")
+          con.execute(f"SET extension_directory=\'{ext_dir}\';")
+          
+          # Try to load the extensions
+          try:
+              con.execute("LOAD json;")
+              print("✅ JSON extension loaded successfully")
+              
+              con.execute("LOAD httpfs;")
+              print("✅ httpfs extension loaded successfully")
+              
+              con.execute("LOAD parquet;")
+              print("✅ parquet extension loaded successfully")
+              
+              # Test JSON functionality
+              result = con.execute("SELECT json_extract(\'{\"a\": 42}\', \'$.a\')").fetchone()[0]
+              print(f"JSON test result: {result}")
+              if result != 42:
+                  print("❌ JSON test failed")
+                  sys.exit(1)
+                  
+              print("All tests passed!")
+              sys.exit(0)
+          except Exception as e:
+              print(f"❌ Error: {str(e)}")
+              sys.exit(1)
+          ' > test_duckdb.py
+      
+      # Run the test script
+      - name: Run DuckDB with downloaded extensions
+        env:
+          EXTENSION_PATH: ${{ steps.extensions.outputs.extensions-path }}
+        run: |
+          echo "Using extensions from: $EXTENSION_PATH"
+          python test_duckdb.py

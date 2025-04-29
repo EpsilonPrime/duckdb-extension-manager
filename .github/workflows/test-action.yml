@@ -1,0 +1,54 @@
+name: Test DuckDB Extension Manager
+
+on:
+  push:
+    branches: [ main, test-* ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:  # Allow manual triggering
+
+jobs:
+  test-action:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      # Test the action using itself (self-referencing)
+      - name: Test DuckDB Extension Manager - Core Extensions
+        id: test-core
+        uses: ./  # This references the action in the current repository
+        with:
+          extensions: |
+            [
+              {"name": "json", "source": "core"},
+              {"name": "httpfs", "source": "core"}
+            ]
+      
+      # Test with direct URL
+      - name: Test DuckDB Extension Manager - Direct URL
+        id: test-url
+        uses: ./
+        with:
+          extensions: |
+            [
+              {"name": "test_ext", "url": "https://extensions.duckdb.org/json/latest/extension.zip"}
+            ]
+          cache-path: '.duckdb/url-extensions'
+      
+      # Verify outputs and results
+      - name: Verify test results
+        run: |
+          echo "Cache hit (core): ${{ steps.test-core.outputs.cache-hit }}"
+          echo "Extensions path (core): ${{ steps.test-core.outputs.extensions-path }}"
+          echo "Cache hit (URL): ${{ steps.test-url.outputs.cache-hit }}"
+          
+          # List the downloaded extensions
+          echo "Core extensions:"
+          ls -la ${{ steps.test-core.outputs.extensions-path }}
+          
+          echo "URL extensions:"
+          ls -la ${{ steps.test-url.outputs.extensions-path }}
+          
+          # Test if we can find extension files
+          find ${{ steps.test-core.outputs.extensions-path }} -type f
